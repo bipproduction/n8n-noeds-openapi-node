@@ -1,5 +1,3 @@
-// === WAJS — Dynamic OpenAPI (Improved GET/HEAD Fix) ===
-
 import type {
     INodeType,
     INodeTypeDescription,
