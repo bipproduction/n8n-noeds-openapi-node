@@ -227,7 +227,7 @@ export class OpenApiNode implements INodeType {
         const items = this.getInputData();
         const returnData: any[] = [];
 
-        const creds = (await this.getCredentials?.("wajsApi")) as
+        const creds = (await this.getCredentials?.("openApiNodeApi")) as
             | { baseUrl?: string; token?: string; apiKey?: string }
             | undefined;
 
