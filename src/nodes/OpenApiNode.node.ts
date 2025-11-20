@@ -7,6 +7,7 @@ import type {
 } from "n8n-workflow";
 
 import axios from "axios";
+import _ from "lodash";
 
 interface OpenAPISpec {
     paths: Record<string, any>;
@@ -195,11 +196,15 @@ export class OpenApiNode implements INodeType {
                             const description = op.description || "No description provided.";
 
                             ops.push({
-                                name: `[${methodLabel}] ${path} — ${summary}`,
+                                name: `[${methodLabel}] ${_.kebabCase(summary).replace(/-/g, " ")}`,
                                 value: opId,
-                                description: `${summary}\n\n${description}\n\nTags: ${
+                                description: `${_.kebabCase(summary).replace(/-/g, " ")}\n\n${description}
+                                \nTags: ${
                                     op.tags ? op.tags.join(", ") : "None"
-                                }\nOperation ID: ${opId}\nMethod: ${methodLabel}\nPath: ${path}`,
+                                }
+                                \nOperation ID: ${opId}
+                                \nMethod: ${methodLabel}
+                                \nPath: ${path}`,
                             });
                         }
                     }
