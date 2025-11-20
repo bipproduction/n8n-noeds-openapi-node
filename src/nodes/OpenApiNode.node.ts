@@ -5,6 +5,7 @@ import type {
     ILoadOptionsFunctions,
     INodePropertyOptions,
 } from "n8n-workflow";
+
 import axios from "axios";
 
 interface OpenAPISpec {
@@ -21,20 +22,6 @@ async function loadOpenAPISpecCached(url: string): Promise<OpenAPISpec> {
     const spec: OpenAPISpec = res.data;
     openApiCache.set(url, spec);
     return spec;
-}
-
-function getDefaultValue(type: string | undefined, schema?: any): any {
-    if (schema?.example !== undefined) return schema.example;
-    if (schema?.default !== undefined) return schema.default;
-    switch (type) {
-        case "string": return "";
-        case "number":
-        case "integer": return 0;
-        case "boolean": return false;
-        case "array": return [];
-        case "object": return {};
-        default: return null;
-    }
 }
 
 function resolveRef(obj: any, spec: OpenAPISpec): any {
@@ -71,17 +58,31 @@ export class OpenApiNode implements INodeType {
                 default: "",
                 required: true,
             },
+
+            {
+                displayName: "Tag Filter",
+                name: "tagFilter",
+                type: "options",
+                default: "",
+                description: "Filter operations based on OpenAPI tags",
+                typeOptions: {
+                    loadOptionsMethod: "loadTags",
+                    loadOptionsDependsOn: ["openapiUrl"],
+                },
+            },
+
             {
                 displayName: "Operation",
                 name: "operation",
                 type: "options",
                 typeOptions: {
                     loadOptionsMethod: "loadOperations",
-                    loadOptionsDependsOn: ["openapiUrl"],
+                    loadOptionsDependsOn: ["openapiUrl", "tagFilter"],
                 },
                 default: "",
                 required: true,
             },
+
             {
                 displayName: "Parameters (Form)",
                 name: "parametersForm",
@@ -131,33 +132,87 @@ export class OpenApiNode implements INodeType {
 
     methods = {
         loadOptions: {
+            // ============================
+            // LOAD TAGS
+            // ============================
+            async loadTags(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+                const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
+                if (!url) return [{ name: "Enter URL first", value: "" }];
+
+                try {
+                    const spec = await loadOpenAPISpecCached(url);
+                    const tags = new Set<string>();
+
+                    for (const path of Object.keys(spec.paths || {})) {
+                        const pathObj = spec.paths[path];
+                        for (const method of Object.keys(pathObj || {})) {
+                            const op = pathObj[method];
+                            if (Array.isArray(op.tags)) {
+                                for (const t of op.tags) tags.add(t);
+                            }
+                        }
+                    }
+
+                    return [...tags].map((t) => ({
+                        name: t,
+                        value: t,
+                        description: `Filter only operations with tag: ${t}`,
+                    }));
+                } catch (err: any) {
+                    return [{ name: `Error: ${err.message}`, value: "" }];
+                }
+            },
+
+            // ============================
+            // LOAD OPERATIONS
+            // ============================
             async loadOperations(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
                 const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
+                const tagFilter = (this.getNodeParameter("tagFilter", "") as string).trim();
+
                 if (!url) return [{ name: "Provide openapiUrl first", value: "" }];
+
                 try {
                     const spec = await loadOpenAPISpecCached(url);
                     const ops: INodePropertyOptions[] = [];
 
                     for (const path of Object.keys(spec.paths || {})) {
                         const pathObj = spec.paths[path];
+
                         for (const method of Object.keys(pathObj || {})) {
                             const op = pathObj[method];
+
+                            if (tagFilter && (!op.tags || !op.tags.includes(tagFilter))) {
+                                continue; // apply tag filter
+                            }
+
                             const opId =
                                 op.operationId ||
                                 `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
-                            const title = (op.summary || opId).toString();
+
+                            const methodLabel = method.toUpperCase();
+                            const summary = op.summary || opId;
+                            const description = op.description || "No description provided.";
+
                             ops.push({
-                                name: `${title} — ${method.toUpperCase()} ${path}`,
+                                name: `[${methodLabel}] ${path} — ${summary}`,
                                 value: opId,
+                                description: `${summary}\n\n${description}\n\nTags: ${
+                                    op.tags ? op.tags.join(", ") : "None"
+                                }\nOperation ID: ${opId}\nMethod: ${methodLabel}\nPath: ${path}`,
                             });
                         }
                     }
-                    return ops;
+
+                    return ops.length ? ops : [{ name: "No operations found", value: "" }];
                 } catch (err: any) {
                     return [{ name: `Error: ${err.message}`, value: "" }];
                 }
             },
 
+            // ============================
+            // LOAD PARAMETER NAMES
+            // ============================
             async loadParameterNames(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
                 const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
                 const opId = (this.getNodeParameter("operation", "") as string).trim();
@@ -193,6 +248,7 @@ export class OpenApiNode implements INodeType {
                                 }
                             }
 
+                            // Body fields
                             const bodySchema =
                                 op.requestBody?.content?.["application/json"]?.schema;
                             if (bodySchema) {
@@ -221,6 +277,9 @@ export class OpenApiNode implements INodeType {
         },
     };
 
+    // ============================
+    // EXECUTE METHOD
+    // ============================
     async execute(this: IExecuteFunctions) {
         const items = this.getInputData();
         const returnData: any[] = [];
@@ -306,7 +365,7 @@ export class OpenApiNode implements INodeType {
                     timeout: 30000,
                 };
 
-                // === FIX: GET & HEAD tidak boleh punya body ===
+                // GET/HEAD must not have body
                 if (!(foundMethod === "get" || foundMethod === "head")) {
                     axiosConfig.data = Object.keys(bodyParams).length ? bodyParams : undefined;
                 }
