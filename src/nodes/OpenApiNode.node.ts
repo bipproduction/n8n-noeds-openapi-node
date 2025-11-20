@@ -15,6 +15,10 @@ interface OpenAPISpec {
 
 const openApiCache: Map<string, OpenAPISpec> = new Map();
 
+// ---------------------------------------------------------------------
+// Cache Loader
+// ---------------------------------------------------------------------
+
 async function loadOpenAPISpecCached(url: string): Promise<OpenAPISpec> {
     if (openApiCache.has(url)) return openApiCache.get(url)!;
     const res = await axios.get(url, { timeout: 20000 });
@@ -23,9 +27,14 @@ async function loadOpenAPISpecCached(url: string): Promise<OpenAPISpec> {
     return spec;
 }
 
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+
 function getDefaultValue(type: string | undefined, schema?: any): any {
     if (schema?.example !== undefined) return schema.example;
     if (schema?.default !== undefined) return schema.default;
+
     switch (type) {
         case "string": return "";
         case "number":
@@ -39,6 +48,7 @@ function getDefaultValue(type: string | undefined, schema?: any): any {
 
 function resolveRef(obj: any, spec: OpenAPISpec): any {
     if (!obj || typeof obj !== "object") return obj;
+
     if (obj.$ref && typeof obj.$ref === "string" && obj.$ref.startsWith("#/")) {
         const refPath = obj.$ref.replace(/^#\//, "").split("/");
         let cur: any = spec;
@@ -47,6 +57,10 @@ function resolveRef(obj: any, spec: OpenAPISpec): any {
     }
     return obj;
 }
+
+// ---------------------------------------------------------------------
+// Node Definition
+// ---------------------------------------------------------------------
 
 export class OpenApiNode implements INodeType {
     description: INodeTypeDescription = {
@@ -60,9 +74,11 @@ export class OpenApiNode implements INodeType {
         defaults: { name: "OpenApiNode" },
         inputs: ["main"],
         outputs: ["main"],
-        credentials: [
-            { name: "openApiNodeApi", required: false },
-        ],
+        credentials: [{ name: "openApiNodeApi", required: false }],
+
+        // -----------------------------------------------------------------
+        // All Editable Properties
+        // -----------------------------------------------------------------
         properties: [
             {
                 displayName: "OpenAPI JSON URL",
@@ -71,17 +87,32 @@ export class OpenApiNode implements INodeType {
                 default: "",
                 required: true,
             },
+
+            // New: Tag Filter
+            {
+                displayName: "Tag Filter (Optional)",
+                name: "tagFilter",
+                type: "options",
+                default: "",
+                description: "Filter operations by tag",
+                typeOptions: {
+                    loadOptionsMethod: "loadTags",
+                    loadOptionsDependsOn: ["openapiUrl"],
+                },
+            },
+
             {
                 displayName: "Operation",
                 name: "operation",
                 type: "options",
-                typeOptions: {
-                    loadOptionsMethod: "loadOperations",
-                    loadOptionsDependsOn: ["openapiUrl"],
-                },
                 default: "",
                 required: true,
+                typeOptions: {
+                    loadOptionsMethod: "loadOperations",
+                    loadOptionsDependsOn: ["openapiUrl", "tagFilter"],
+                },
             },
+
             {
                 displayName: "Parameters (Form)",
                 name: "parametersForm",
@@ -98,23 +129,23 @@ export class OpenApiNode implements INodeType {
                                 displayName: "Name",
                                 name: "name",
                                 type: "options",
+                                default: "",
                                 typeOptions: {
                                     loadOptionsMethod: "loadParameterNames",
                                     loadOptionsDependsOn: ["openapiUrl", "operation"],
                                 },
-                                default: "",
                             },
                             {
                                 displayName: "In",
                                 name: "in",
                                 type: "options",
-                                options: [
-                                    { name: "query", value: "query" },
-                                    { name: "path", value: "path" },
-                                    { name: "header", value: "header" },
-                                    { name: "body", value: "body" },
-                                ],
                                 default: "query",
+                                options: [
+                                    { name: "Query", value: "query" },
+                                    { name: "Path", value: "path" },
+                                    { name: "Header", value: "header" },
+                                    { name: "Body", value: "body" },
+                                ],
                             },
                             {
                                 displayName: "Value",
@@ -129,51 +160,109 @@ export class OpenApiNode implements INodeType {
         ],
     };
 
+    // ---------------------------------------------------------------------
+    // Methods
+    // ---------------------------------------------------------------------
+
     methods = {
         loadOptions: {
-            async loadOperations(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+            // -------------------------------------------------------------
+            // Load Tags
+            // -------------------------------------------------------------
+            async loadTags(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
                 const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
                 if (!url) return [{ name: "Provide openapiUrl first", value: "" }];
+
+                try {
+                    const spec = await loadOpenAPISpecCached(url);
+                    const tagSet = new Set<string>();
+
+                    for (const path of Object.keys(spec.paths || {})) {
+                        const pathObj = spec.paths[path];
+                        for (const method of Object.keys(pathObj || {})) {
+                            const op = pathObj[method];
+                            (op.tags || []).forEach((t: string) => tagSet.add(t));
+                        }
+                    }
+
+                    return [...tagSet].map(tag => ({
+                        name: tag,
+                        value: tag,
+                    }));
+                } catch (err: any) {
+                    return [{ name: `Error: ${err.message}`, value: "" }];
+                }
+            },
+
+            // -------------------------------------------------------------
+            // Load Operations (with tag filter)
+            // -------------------------------------------------------------
+            async loadOperations(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+                const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
+                const selectedTag = (this.getNodeParameter("tagFilter", "") as string).trim();
+
+                if (!url) return [{ name: "Provide openapiUrl first", value: "" }];
+
                 try {
                     const spec = await loadOpenAPISpecCached(url);
                     const ops: INodePropertyOptions[] = [];
 
                     for (const path of Object.keys(spec.paths || {})) {
                         const pathObj = spec.paths[path];
+
                         for (const method of Object.keys(pathObj || {})) {
                             const op = pathObj[method];
+
+                            // Apply tag filter
+                            if (selectedTag && !(op.tags || []).includes(selectedTag)) continue;
+
                             const opId =
                                 op.operationId ||
                                 `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
-                            const title = (op.summary || opId).toString();
+
+                            const title = op.summary || opId;
+
                             ops.push({
-                                name: `${title} — ${method.toUpperCase()} ${path}`,
+                                name: `${method.toUpperCase()} ${path}`,
                                 value: opId,
+                                description: title,
                             });
                         }
                     }
-                    return ops;
+
+                    return ops.length
+                        ? ops
+                        : [{ name: "No operations found for selected tag", value: "" }];
+
                 } catch (err: any) {
                     return [{ name: `Error: ${err.message}`, value: "" }];
                 }
             },
 
+            // -------------------------------------------------------------
+            // Load Parameter Names
+            // -------------------------------------------------------------
             async loadParameterNames(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
                 const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
                 const opId = (this.getNodeParameter("operation", "") as string).trim();
+
                 if (!url || !opId) return [{ name: "Select operation first", value: "" }];
 
                 try {
                     const spec = await loadOpenAPISpecCached(url);
                     const out: INodePropertyOptions[] = [];
+                    const seen = new Set<string>();
 
                     outer: for (const path of Object.keys(spec.paths || {})) {
                         const pathObj = spec.paths[path];
+
                         for (const method of Object.keys(pathObj || {})) {
                             const op = pathObj[method];
+
                             const id =
                                 op.operationId ||
                                 `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
+
                             if (id !== opId) continue;
 
                             const params = [
@@ -181,23 +270,21 @@ export class OpenApiNode implements INodeType {
                                 ...(op.parameters || []),
                             ];
 
-                            const seen = new Set<string>();
-
                             for (const p of params) {
                                 if (!seen.has(p.name)) {
                                     seen.add(p.name);
                                     out.push({
                                         name: `${p.name} (in=${p.in})`,
-                                        value: p.name,
+                                        value: p.name
                                     });
                                 }
                             }
 
-                            const bodySchema =
-                                op.requestBody?.content?.["application/json"]?.schema;
+                            const bodySchema = op.requestBody?.content?.["application/json"]?.schema;
                             if (bodySchema) {
                                 const resolved = resolveRef(bodySchema, spec);
                                 const props = resolved.properties || {};
+
                                 for (const propName of Object.keys(props)) {
                                     if (!seen.has(propName)) {
                                         seen.add(propName);
@@ -221,6 +308,10 @@ export class OpenApiNode implements INodeType {
         },
     };
 
+    // ---------------------------------------------------------------------
+    // Execute API Call
+    // ---------------------------------------------------------------------
+
     async execute(this: IExecuteFunctions) {
         const items = this.getInputData();
         const returnData: any[] = [];
@@ -241,11 +332,14 @@ export class OpenApiNode implements INodeType {
 
                 outer: for (const path of Object.keys(spec.paths || {})) {
                     const pathObj = spec.paths[path];
+
                     for (const method of Object.keys(pathObj || {})) {
                         const op = pathObj[method];
+
                         const id =
                             op.operationId ||
                             `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
+
                         if (id === operationId) {
                             foundOp = op;
                             foundPath = path;
@@ -258,15 +352,16 @@ export class OpenApiNode implements INodeType {
                 if (!foundOp) throw new Error("Operation not found");
 
                 const paramsForm = this.getNodeParameter("parametersForm", i, {}) as any;
-                let queryParams: Record<string, any> = {};
-                let bodyParams: Record<string, any> = {};
+
+                const queryParams: Record<string, any> = {};
+                const bodyParams: Record<string, any> = {};
 
                 const pathParams = [
                     ...(spec.paths[foundPath].parameters || []),
                     ...(foundOp.parameters || []),
                 ];
 
-                if (paramsForm && Array.isArray(paramsForm.parameter)) {
+                if (paramsForm?.parameter) {
                     for (const p of paramsForm.parameter) {
                         if (p.in === "query") queryParams[p.name] = p.value;
                         else if (p.in === "body") bodyParams[p.name] = p.value;
@@ -274,6 +369,7 @@ export class OpenApiNode implements INodeType {
                     }
                 }
 
+                // Build final URL
                 let baseUrl =
                     creds?.baseUrl ||
                     spec.servers?.[0]?.url ||
@@ -286,7 +382,7 @@ export class OpenApiNode implements INodeType {
                     if (p.in === "path") {
                         const item = paramsForm.parameter.find((x: any) => x.name === p.name);
                         const val = item?.value;
-                        if (!val) throw new Error(`Missing path param ${p.name}`);
+                        if (!val) throw new Error(`Missing path param: ${p.name}`);
                         url = url.replace(`{${p.name}}`, encodeURIComponent(val));
                     }
                 }
@@ -306,16 +402,18 @@ export class OpenApiNode implements INodeType {
                     timeout: 30000,
                 };
 
-                // === FIX: GET & HEAD tidak boleh punya body ===
+                // GET/HEAD cannot have body
                 if (!(foundMethod === "get" || foundMethod === "head")) {
-                    axiosConfig.data = Object.keys(bodyParams).length ? bodyParams : undefined;
+                    axiosConfig.data = Object.keys(bodyParams).length
+                        ? bodyParams
+                        : undefined;
                 }
 
                 const resp = await axios(axiosConfig);
                 returnData.push({ json: resp.data });
 
             } catch (err: any) {
-                if (this.continueOnFail && this.continueOnFail()) {
+                if (this.continueOnFail?.()) {
                     returnData.push({
                         json: {
                             error: true,
@@ -323,9 +421,9 @@ export class OpenApiNode implements INodeType {
                             response: err.response?.data,
                         },
                     });
-                    continue;
+                } else {
+                    throw err;
                 }
-                throw err;
             }
         }
 
