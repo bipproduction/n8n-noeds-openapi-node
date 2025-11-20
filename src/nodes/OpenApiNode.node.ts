@@ -1,432 +1,361 @@
-import type {
-    INodeType,
-    INodeTypeDescription,
-    IExecuteFunctions,
-    ILoadOptionsFunctions,
-    INodePropertyOptions,
-} from "n8n-workflow";
-import axios from "axios";
+// mcp_tool_convert.ts
+import _ from "lodash";
 
-interface OpenAPISpec {
-    paths: Record<string, any>;
-    components?: Record<string, any>;
-    servers?: Array<{ url: string }>;
-}
-
-const openApiCache: Map<string, OpenAPISpec> = new Map();
-
-// ---------------------------------------------------------------------
-// Cache Loader
-// ---------------------------------------------------------------------
-
-async function loadOpenAPISpecCached(url: string): Promise<OpenAPISpec> {
-    if (openApiCache.has(url)) return openApiCache.get(url)!;
-    const res = await axios.get(url, { timeout: 20000 });
-    const spec: OpenAPISpec = res.data;
-    openApiCache.set(url, spec);
-    return spec;
-}
-
-// ---------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------
-
-function getDefaultValue(type: string | undefined, schema?: any): any {
-    if (schema?.example !== undefined) return schema.example;
-    if (schema?.default !== undefined) return schema.default;
-
-    switch (type) {
-        case "string": return "";
-        case "number":
-        case "integer": return 0;
-        case "boolean": return false;
-        case "array": return [];
-        case "object": return {};
-        default: return null;
-    }
-}
-
-function resolveRef(obj: any, spec: OpenAPISpec): any {
-    if (!obj || typeof obj !== "object") return obj;
-
-    if (obj.$ref && typeof obj.$ref === "string" && obj.$ref.startsWith("#/")) {
-        const refPath = obj.$ref.replace(/^#\//, "").split("/");
-        let cur: any = spec;
-        for (const seg of refPath) cur = cur?.[seg];
-        return cur || obj;
-    }
-    return obj;
-}
-
-// ---------------------------------------------------------------------
-// Node Definition
-// ---------------------------------------------------------------------
-
-export class OpenApiNode implements INodeType {
-    description: INodeTypeDescription = {
-        displayName: "OpenApiNode - Dynamic OpenAPI",
-        name: "openApiNode",
-        icon: "file:icon.svg",
-        group: ["transform"],
-        version: 1,
-        subtitle: "={{$parameter['operation'] || 'select operation'}}",
-        description: "Dynamic UI n8n node generated from OpenAPI",
-        defaults: { name: "OpenApiNode" },
-        inputs: ["main"],
-        outputs: ["main"],
-        credentials: [{ name: "openApiNodeApi", required: false }],
-
-        // -----------------------------------------------------------------
-        // All Editable Properties
-        // -----------------------------------------------------------------
-        properties: [
-            {
-                displayName: "OpenAPI JSON URL",
-                name: "openapiUrl",
-                type: "string",
-                default: "",
-                required: true,
-            },
-
-            // New: Tag Filter
-            {
-                displayName: "Tag Filter (Optional)",
-                name: "tagFilter",
-                type: "options",
-                default: "",
-                description: "Filter operations by tag",
-                typeOptions: {
-                    loadOptionsMethod: "loadTags",
-                    loadOptionsDependsOn: ["openapiUrl"],
-                },
-            },
-
-            {
-                displayName: "Operation",
-                name: "operation",
-                type: "options",
-                default: "",
-                required: true,
-                typeOptions: {
-                    loadOptionsMethod: "loadOperations",
-                    loadOptionsDependsOn: ["openapiUrl", "tagFilter"],
-                },
-            },
-
-            {
-                displayName: "Parameters (Form)",
-                name: "parametersForm",
-                type: "fixedCollection",
-                placeholder: "Add Parameter",
-                typeOptions: { multipleValues: true },
-                default: {},
-                options: [
-                    {
-                        name: "parameter",
-                        displayName: "Parameter",
-                        values: [
-                            {
-                                displayName: "Name",
-                                name: "name",
-                                type: "options",
-                                default: "",
-                                typeOptions: {
-                                    loadOptionsMethod: "loadParameterNames",
-                                    loadOptionsDependsOn: ["openapiUrl", "operation"],
-                                },
-                            },
-                            {
-                                displayName: "In",
-                                name: "in",
-                                type: "options",
-                                default: "query",
-                                options: [
-                                    { name: "Query", value: "query" },
-                                    { name: "Path", value: "path" },
-                                    { name: "Header", value: "header" },
-                                    { name: "Body", value: "body" },
-                                ],
-                            },
-                            {
-                                displayName: "Value",
-                                name: "value",
-                                type: "string",
-                                default: "",
-                            },
-                        ],
-                    },
-                ],
-            },
-        ],
+/**
+ * ============================
+ *  Types
+ * ============================
+ */
+interface McpTool {
+    name: string;
+    description: string;
+    inputSchema: any;
+    "x-props": {
+        method: string;
+        path: string;
+        operationId?: string;
+        tag?: string;
+        deprecated?: boolean;
+        summary?: string;
+        parameters?: any[];
     };
+}
 
-    // ---------------------------------------------------------------------
-    // Methods
-    // ---------------------------------------------------------------------
+/**
+ * ============================
+ *  Public: convertOpenApiToMcpTools
+ * ============================
+ * Convert OpenAPI 3.x spec → MCP Tools
+ * - filterTag : match against operation tags
+ */
+export function convertOpenApiToMcpTools(openApiJson: any, filterTag: string): McpTool[] {
+    const tools: McpTool[] = [];
 
-    methods = {
-        loadOptions: {
-            // -------------------------------------------------------------
-            // Load Tags
-            // -------------------------------------------------------------
-            async loadTags(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-                const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
-                if (!url) return [{ name: "Provide openapiUrl first", value: "" }];
+    if (!openApiJson || typeof openApiJson !== "object") {
+        console.warn("Invalid OpenAPI JSON");
+        return tools;
+    }
 
-                try {
-                    const spec = await loadOpenAPISpecCached(url);
-                    const tagSet = new Set<string>();
+    const paths = openApiJson.paths || {};
+    if (Object.keys(paths).length === 0) {
+        console.warn("No paths found in OpenAPI spec");
+        return tools;
+    }
 
-                    for (const path of Object.keys(spec.paths || {})) {
-                        const pathObj = spec.paths[path];
-                        for (const method of Object.keys(pathObj || {})) {
-                            const op = pathObj[method];
-                            (op.tags || []).forEach((t: string) => tagSet.add(t));
-                        }
-                    }
+    for (const [path, methods] of Object.entries<any>(paths)) {
+        if (!methods || typeof methods !== "object") continue;
 
-                    return [...tagSet].map(tag => ({
-                        name: tag,
-                        value: tag,
-                    }));
-                } catch (err: any) {
-                    return [{ name: `Error: ${err.message}`, value: "" }];
-                }
-            },
+        for (const [method, operation] of Object.entries<any>(methods)) {
+            const valid = ["get", "post", "put", "delete", "patch", "head", "options"];
+            if (!valid.includes(method.toLowerCase())) continue;
 
-            // -------------------------------------------------------------
-            // Load Operations (with tag filter)
-            // -------------------------------------------------------------
-            async loadOperations(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-                const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
-                const selectedTag = (this.getNodeParameter("tagFilter", "") as string).trim();
+            if (!operation || typeof operation !== "object") continue;
 
-                if (!url) return [{ name: "Provide openapiUrl first", value: "" }];
+            const tags = Array.isArray(operation.tags) ? operation.tags : [];
 
-                try {
-                    const spec = await loadOpenAPISpecCached(url);
-                    const ops: INodePropertyOptions[] = [];
+            // Tag filter
+            if (
+                filterTag &&
+                (!tags.length ||
+                    !tags.some((t: string) =>
+                        t?.toLowerCase().includes(filterTag.toLowerCase())
+                    ))
+            ) {
+                continue;
+            }
 
-                    for (const path of Object.keys(spec.paths || {})) {
-                        const pathObj = spec.paths[path];
-
-                        for (const method of Object.keys(pathObj || {})) {
-                            const op = pathObj[method];
-
-                            // Apply tag filter
-                            if (selectedTag && !(op.tags || []).includes(selectedTag)) continue;
-
-                            const opId =
-                                op.operationId ||
-                                `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
-
-                            const title = op.summary || opId;
-
-                            ops.push({
-                                name: `${method.toUpperCase()} ${path}`,
-                                value: opId,
-                                description: title,
-                            });
-                        }
-                    }
-
-                    return ops.length
-                        ? ops
-                        : [{ name: "No operations found for selected tag", value: "" }];
-
-                } catch (err: any) {
-                    return [{ name: `Error: ${err.message}`, value: "" }];
-                }
-            },
-
-            // -------------------------------------------------------------
-            // Load Parameter Names
-            // -------------------------------------------------------------
-            async loadParameterNames(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-                const url = (this.getNodeParameter("openapiUrl", "") as string).trim();
-                const opId = (this.getNodeParameter("operation", "") as string).trim();
-
-                if (!url || !opId) return [{ name: "Select operation first", value: "" }];
-
-                try {
-                    const spec = await loadOpenAPISpecCached(url);
-                    const out: INodePropertyOptions[] = [];
-                    const seen = new Set<string>();
-
-                    outer: for (const path of Object.keys(spec.paths || {})) {
-                        const pathObj = spec.paths[path];
-
-                        for (const method of Object.keys(pathObj || {})) {
-                            const op = pathObj[method];
-
-                            const id =
-                                op.operationId ||
-                                `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
-
-                            if (id !== opId) continue;
-
-                            const params = [
-                                ...(pathObj.parameters || []),
-                                ...(op.parameters || []),
-                            ];
-
-                            for (const p of params) {
-                                if (!seen.has(p.name)) {
-                                    seen.add(p.name);
-                                    out.push({
-                                        name: `${p.name} (in=${p.in})`,
-                                        value: p.name
-                                    });
-                                }
-                            }
-
-                            const bodySchema = op.requestBody?.content?.["application/json"]?.schema;
-                            if (bodySchema) {
-                                const resolved = resolveRef(bodySchema, spec);
-                                const props = resolved.properties || {};
-
-                                for (const propName of Object.keys(props)) {
-                                    if (!seen.has(propName)) {
-                                        seen.add(propName);
-                                        out.push({
-                                            name: `${propName} (body)`,
-                                            value: propName,
-                                        });
-                                    }
-                                }
-                            }
-
-                            break outer;
-                        }
-                    }
-
-                    return out;
-                } catch (err: any) {
-                    return [{ name: `Error: ${err.message}`, value: "" }];
-                }
-            },
-        },
-    };
-
-    // ---------------------------------------------------------------------
-    // Execute API Call
-    // ---------------------------------------------------------------------
-
-    async execute(this: IExecuteFunctions) {
-        const items = this.getInputData();
-        const returnData: any[] = [];
-
-        const creds = (await this.getCredentials?.("openApiNodeApi")) as
-            | { baseUrl?: string; token?: string; apiKey?: string }
-            | undefined;
-
-        for (let i = 0; i < items.length; i++) {
             try {
-                const openapiUrl = this.getNodeParameter("openapiUrl", i, "") as string;
-                const operationId = this.getNodeParameter("operation", i, "") as string;
-                const spec = await loadOpenAPISpecCached(openapiUrl);
-
-                let foundOp: any = null;
-                let foundPath = "";
-                let foundMethod = "";
-
-                outer: for (const path of Object.keys(spec.paths || {})) {
-                    const pathObj = spec.paths[path];
-
-                    for (const method of Object.keys(pathObj || {})) {
-                        const op = pathObj[method];
-
-                        const id =
-                            op.operationId ||
-                            `${method}_${path.replace(/[{}]/g, "").replace(/\//g, "_")}`;
-
-                        if (id === operationId) {
-                            foundOp = op;
-                            foundPath = path;
-                            foundMethod = method.toLowerCase();
-                            break outer;
-                        }
-                    }
-                }
-
-                if (!foundOp) throw new Error("Operation not found");
-
-                const paramsForm = this.getNodeParameter("parametersForm", i, {}) as any;
-
-                const queryParams: Record<string, any> = {};
-                const bodyParams: Record<string, any> = {};
-
-                const pathParams = [
-                    ...(spec.paths[foundPath].parameters || []),
-                    ...(foundOp.parameters || []),
-                ];
-
-                if (paramsForm?.parameter) {
-                    for (const p of paramsForm.parameter) {
-                        if (p.in === "query") queryParams[p.name] = p.value;
-                        else if (p.in === "body") bodyParams[p.name] = p.value;
-                        else if (p.in === "header") queryParams[p.name] = p.value;
-                    }
-                }
-
-                // Build final URL
-                let baseUrl =
-                    creds?.baseUrl ||
-                    spec.servers?.[0]?.url ||
-                    "";
-                baseUrl = baseUrl.replace(/\/+$/, "");
-
-                let url = baseUrl + foundPath;
-
-                for (const p of pathParams) {
-                    if (p.in === "path") {
-                        const item = paramsForm.parameter.find((x: any) => x.name === p.name);
-                        const val = item?.value;
-                        if (!val) throw new Error(`Missing path param: ${p.name}`);
-                        url = url.replace(`{${p.name}}`, encodeURIComponent(val));
-                    }
-                }
-
-                const headers: Record<string, any> = {
-                    "Content-Type": "application/json",
-                };
-
-                if (creds?.token) headers["Authorization"] = `Bearer ${creds.token}`;
-                if (creds?.apiKey) headers["X-API-Key"] = creds.apiKey;
-
-                const axiosConfig: any = {
-                    method: foundMethod,
-                    url,
-                    headers,
-                    params: queryParams,
-                    timeout: 30000,
-                };
-
-                // GET/HEAD cannot have body
-                if (!(foundMethod === "get" || foundMethod === "head")) {
-                    axiosConfig.data = Object.keys(bodyParams).length
-                        ? bodyParams
-                        : undefined;
-                }
-
-                const resp = await axios(axiosConfig);
-                returnData.push({ json: resp.data });
-
-            } catch (err: any) {
-                if (this.continueOnFail?.()) {
-                    returnData.push({
-                        json: {
-                            error: true,
-                            message: err.message,
-                            response: err.response?.data,
-                        },
-                    });
-                } else {
-                    throw err;
-                }
+                const tool = createToolFromOperation(path, method, operation, tags);
+                if (tool) tools.push(tool);
+            } catch (err) {
+                console.error(`Error building tool for ${method.toUpperCase()} ${path}`, err);
             }
         }
+    }
 
-        return [returnData];
+    return tools;
+}
+
+/**
+ * ============================
+ *  Build Tool from Operation
+ * ============================
+ */
+function createToolFromOperation(
+    path: string,
+    method: string,
+    operation: any,
+    tags: string[]
+): McpTool | null {
+    const rawName = _.snakeCase(operation.operationId || `${method}_${path}`) || "unnamed_tool";
+    const name = cleanToolName(rawName);
+
+    if (name === "unnamed_tool") {
+        console.warn(`Invalid tool name: ${method} ${path}`);
+        return null;
+    }
+
+    const description =
+        operation.description ||
+        operation.summary ||
+        `Execute ${method.toUpperCase()} ${path}`;
+
+    // Build executor parameter array
+    const parameters: any[] = [];
+
+    if (Array.isArray(operation.parameters)) {
+        for (const p of operation.parameters) {
+            if (!p || typeof p !== "object") continue;
+
+            parameters.push({
+                name: p.name,
+                in: p.in,
+                required: !!p.required,
+                description: p.description,
+                schema: p.schema || { type: "string" },
+            });
+        }
+    }
+
+    // Synthetic requestBody param
+    if (operation.requestBody?.content) {
+        const schema = extractPreferredContentSchema(operation.requestBody.content);
+
+        parameters.push({
+            name: "body",
+            in: "requestBody",
+            required: !!operation.requestBody.required,
+            schema: schema || { type: "object" },
+            description: operation.requestBody.description || "Request body",
+        });
+    }
+
+    // Build input schema
+    let schema: any = null;
+
+    const lower = method.toLowerCase();
+    if (["get", "delete", "head"].includes(lower)) {
+        schema = extractParametersSchema(operation.parameters || []);
+    } else {
+        schema = extractRequestBodySchema(operation) ||
+                 extractParametersSchema(operation.parameters || []);
+    }
+
+    const inputSchema = createInputSchema(schema);
+
+    return {
+        name,
+        description,
+        "x-props": {
+            method: method.toUpperCase(),
+            path,
+            operationId: operation.operationId,
+            tag: tags[0],
+            deprecated: operation.deprecated || false,
+            summary: operation.summary,
+            parameters,
+        },
+        inputSchema,
+    };
+}
+
+/**
+ * ============================
+ *  Extract Preferred Content Schema
+ * ============================
+ */
+function extractPreferredContentSchema(content: any): any {
+    if (!content) return null;
+
+    const preferred = [
+        "application/json",
+        "multipart/form-data",
+        "application/x-www-form-urlencoded",
+        "text/plain",
+    ];
+
+    for (const type of preferred) {
+        if (content[type]?.schema) return content[type].schema;
+    }
+
+    const first = Object.values<any>(content)[0];
+    return first?.schema || null;
+}
+
+/**
+ * ============================
+ *  Extract Parameter Schema (GET/DELETE)
+ * ============================
+ */
+function extractParametersSchema(parameters: any[]): any | null {
+    if (!parameters.length) return null;
+
+    const properties: any = {};
+    const required: string[] = [];
+
+    for (const param of parameters) {
+        if (!["path", "query", "header"].includes(param.in)) continue;
+
+        const name = param.name;
+        if (!name) continue;
+
+        const schema = param.schema || { type: "string" };
+
+        properties[name] = {
+            type: schema.type || "string",
+            description: param.description || `${param.in} parameter: ${name}`,
+            ...extractSchemaDetails(schema),
+        };
+
+        if (param.required) required.push(name);
+    }
+
+    if (!Object.keys(properties).length) return null;
+
+    return { type: "object", properties, required };
+}
+
+/**
+ * ============================
+ *  Extract RequestBody Schema
+ * ============================
+ */
+function extractRequestBodySchema(operation: any): any | null {
+    return extractPreferredContentSchema(operation?.requestBody?.content);
+}
+
+/**
+ * ============================
+ *  Create MCP Input Schema
+ * ============================
+ */
+function createInputSchema(schema: any): any {
+    if (!schema || typeof schema !== "object") {
+        return { type: "object", properties: {}, additionalProperties: false };
+    }
+
+    const properties: any = {};
+    const required: string[] = Array.isArray(schema.required) ? [...schema.required] : [];
+
+    if (schema.properties) {
+        for (const [key, prop] of Object.entries<any>(schema.properties)) {
+            const cleaned = cleanProperty(prop);
+            if (cleaned) properties[key] = cleaned;
+        }
+    }
+
+    if (schema.type === "array" && schema.items) {
+        properties.items = cleanProperty(schema.items) || { type: "string" };
+    }
+
+    return {
+        type: "object",
+        properties,
+        required,
+        additionalProperties: false,
+    };
+}
+
+/**
+ * ============================
+ *  Clean Individual Schema Property
+ * ============================
+ */
+function cleanProperty(prop: any): any | null {
+    if (!prop || typeof prop !== "object") return { type: "string" };
+
+    const out: any = { type: prop.type || "string" };
+
+    Object.assign(out, extractSchemaDetails(prop));
+
+    if (prop.properties) {
+        out.properties = {};
+        for (const [k, v] of Object.entries<any>(prop.properties)) {
+            const cleaned = cleanProperty(v);
+            if (cleaned) out.properties[k] = cleaned;
+        }
+
+        if (Array.isArray(prop.required)) {
+            out.required = prop.required.filter((r: any) => typeof r === "string");
+        }
+    }
+
+    if (prop.items) {
+        out.items = cleanProperty(prop.items);
+    }
+
+    if (Array.isArray(prop.oneOf)) out.oneOf = prop.oneOf.map(cleanProperty);
+    if (Array.isArray(prop.anyOf)) out.anyOf = prop.anyOf.map(cleanProperty);
+    if (Array.isArray(prop.allOf)) out.allOf = prop.allOf.map(cleanProperty);
+
+    return out;
+}
+
+/**
+ * ============================
+ *  Extract Allowed Schema Fields
+ * ============================
+ */
+function extractSchemaDetails(schema: any) {
+    const allowed = [
+        "description",
+        "examples",
+        "example",
+        "default",
+        "enum",
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "format",
+        "multipleOf",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+    ];
+
+    const out: any = {};
+    for (const f of allowed) {
+        if (schema[f] !== undefined) out[f] = schema[f];
+    }
+    return out;
+}
+
+/**
+ * ============================
+ *  Clean tool name safely
+ * ============================
+ */
+function cleanToolName(value: string): string {
+    if (!value) return "unnamed_tool";
+
+    return value
+        .replace(/[{}]/g, "")
+        .replace(/[^a-zA-Z0-9_]/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_|_$/g, "")
+        .toLowerCase() || "unnamed_tool";
+}
+
+/**
+ * ============================
+ *  Public: getMcpTools
+ * ============================
+ */
+export async function getMcpTools(url: string, filterTag: string): Promise<McpTool[]> {
+    try {
+        console.log(`Fetching OpenAPI spec: ${url}`);
+
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const json = await res.json();
+        const tools = convertOpenApiToMcpTools(json, filterTag);
+
+        console.log(`Generated ${tools.length} MCP tools`);
+        return tools;
+    } catch (err) {
+        console.error("Error fetching MCP Tools:", err);
+        throw err;
     }
 }
